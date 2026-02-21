@@ -1,0 +1,26 @@
+[
+    {
+      "url": "https://github.com/frappe/education.git",
+      "branch": "v15.5.0"
+    },
+    {
+      "url": "https://github.com/frappe/hrms.git",
+      "branch": "v15.28.3"
+    },
+    {
+      "url": "https://github.com/frappe/erpnext.git",
+      "branch": "v15.29.3"
+    },
+    {
+      "url": "https://github.com/frappe/helpdesk.git",
+      "branch": "version-14"
+    },
+    {
+      "url": "https://github.com/developmentforpeople/dfp_external_storage.git",
+      "branch": "version-15"
+    },
+    {
+      "url": "https://github.com/Ponnusamy1-V/frappe-pdf.git",
+      "branch": "main"
+    }
+]

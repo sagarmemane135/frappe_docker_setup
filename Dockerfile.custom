@@ -1,0 +1,56 @@
+# ==========================================
+# Dockerfile.custom
+# Extends frappe-base and installs custom apps
+# Compatible with Frappe v15.34.1
+# ==========================================
+
+# Base image must be passed during build
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Re-declare argument after FROM
+ARG APPS_JSON_BASE64
+
+USER frappe
+
+WORKDIR /home/frappe/frappe-bench
+
+# Install custom apps from apps.json
+RUN if [ -n "$APPS_JSON_BASE64" ]; then \
+    echo "Decoding apps.json..." && \
+    echo "$APPS_JSON_BASE64" | base64 -d > /home/frappe/frappe-bench/apps.json && \
+    echo "Installing apps from apps.json..." && \
+    cat /home/frappe/frappe-bench/apps.json | jq -c '.[]' | while read app; do \
+        url=$(echo "$app" | jq -r '.url'); \
+        branch=$(echo "$app" | jq -r '.branch'); \
+        echo "Installing app from $url (branch: $branch)"; \
+        bench get-app --branch "$branch" "$url"; \
+    done && \
+    echo "Adding socketio_port to common_site_config.json for helpdesk/other app builds..." && \
+    jq '. + {"socketio_port": "9000"}' sites/common_site_config.json > sites/common_site_config.json.tmp && mv sites/common_site_config.json.tmp sites/common_site_config.json && \
+    echo "Installing Python dependencies..." && \
+    bench setup requirements && \
+    echo "Re-applying pinned deps from requirements-pinned.txt (same flow as base image)..." && \
+    bench pip install --no-cache-dir -r /tmp/requirements-pinned.txt && \
+    echo "Building assets (custom apps only when names are listed in apps.json)..." && \
+    APP_NAMES=$(jq -r '.[].name // empty' /home/frappe/frappe-bench/apps.json) && \
+    if [ -n "$APP_NAMES" ]; then \
+      for app in $APP_NAMES; do echo "Building assets for app: $app" && bench build --app "$app"; done; \
+    else \
+      bench build; \
+    fi && \
+    echo "Cleaning up..." && \
+    rm /home/frappe/frappe-bench/apps.json ; \
+else \
+    echo "No custom apps.json provided, skipping custom app installation."; \
+fi
+
+# Persistent runtime volumes (match official frappe_docker for pwd.yml/compose)
+VOLUME [ \
+  "/home/frappe/frappe-bench/sites", \
+  "/home/frappe/frappe-bench/sites/assets", \
+  "/home/frappe/frappe-bench/logs" \
+]
+
+# CMD is inherited from base image (gunicorn). pwd.yml/compose override with
+# nginx-entrypoint.sh, bench worker, bench schedule, node socketio.js, etc.

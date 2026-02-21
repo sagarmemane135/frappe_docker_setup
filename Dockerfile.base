@@ -1,0 +1,152 @@
+# ================================
+# Dockerfile.base
+# fully version configurable
+# supports BASE_APPS_JSON_BASE64
+# ================================
+
+ARG PYTHON_VERSION=3.11.6
+ARG DEBIAN_BASE=bookworm
+
+FROM python:${PYTHON_VERSION}-slim-${DEBIAN_BASE} AS base
+
+# re-declare args after FROM
+ARG PYTHON_VERSION
+ARG NODE_VERSION=18.18.2
+ARG FRAPPE_BRANCH=v15.34.1
+ARG FRAPPE_PATH=https://github.com/frappe/frappe
+ARG WKHTMLTOPDF_VERSION=0.12.6.1-3
+ARG WKHTMLTOPDF_DISTRO=bookworm
+
+# nginx resources
+COPY resources/core/nginx/nginx-template.conf /templates/nginx/frappe.conf.template
+COPY resources/core/nginx/nginx-entrypoint.sh /usr/local/bin/nginx-entrypoint.sh
+# Pinned deps for bench env (setuptools for pkg_resources; add more pins as needed)
+COPY resources/base/requirements-pinned.txt /tmp/requirements-pinned.txt
+# Ensure LF line endings (avoids "no such file or directory" when script has CRLF on Windows)
+RUN sed -i 's/\r$//' /usr/local/bin/nginx-entrypoint.sh
+
+ENV NVM_DIR=/home/frappe/.nvm
+ENV PATH=${NVM_DIR}/versions/node/v${NODE_VERSION}/bin/:${PATH}
+
+# system setup
+RUN useradd -ms /bin/bash frappe \
+ && apt-get update \
+ && apt-get install --no-install-recommends -y \
+    curl git vim nginx gettext-base file \
+    libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0 libpangocairo-1.0-0 \
+    restic gpg mariadb-client postgresql-client libpq-dev \
+    wait-for-it jq media-types \
+ && mkdir -p ${NVM_DIR} \
+ && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash \
+ && . ${NVM_DIR}/nvm.sh \
+ && nvm install ${NODE_VERSION} \
+ && nvm use ${NODE_VERSION} \
+ && npm install -g yarn \
+ && pip install --no-cache-dir frappe-bench \
+ && chmod +x /usr/local/bin/nginx-entrypoint.sh \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -f /etc/nginx/sites-enabled/default \
+ && sed -i '/user www-data/d' /etc/nginx/nginx.conf \
+ && ln -sf /dev/stdout /var/log/nginx/access.log \
+ && ln -sf /dev/stderr /var/log/nginx/error.log \
+ && touch /run/nginx.pid \
+ && chown -R frappe:frappe /etc/nginx/conf.d /etc/nginx/nginx.conf /var/log/nginx /var/lib/nginx /run/nginx.pid
+
+# === Google Chrome Headless (for PDF / print) ===
+RUN set -e; \
+    echo '>>> Starting Chrome installation layer' && \
+    apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y wget ca-certificates && \
+    if [ "$(uname -m)" = "amd64" ] || [ "$(uname -m)" = "x86_64" ]; then \
+        wget -q -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-broken /tmp/google-chrome-stable_current_amd64.deb && \
+        rm /tmp/google-chrome-stable_current_amd64.deb && \
+        ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome && \
+        echo '>>> Google Chrome installed.'; \
+    else \
+        echo ">>> Google Chrome not available for $(uname -m). Skipping."; \
+    fi && \
+    apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ================================
+# builder stage
+# ================================
+
+FROM base AS builder
+
+ARG FRAPPE_BRANCH
+ARG FRAPPE_PATH
+ARG BASE_APPS_JSON_BASE64
+
+USER frappe
+
+WORKDIR /home/frappe
+
+RUN if [ -n "$BASE_APPS_JSON_BASE64" ]; then \
+    echo "Decoding base apps.json..." && \
+    echo "$BASE_APPS_JSON_BASE64" | base64 -d > base-apps.json && \
+    cat base-apps.json && \
+    bench init \
+      --apps_path=base-apps.json \
+      --frappe-branch=${FRAPPE_BRANCH} \
+      --frappe-path=${FRAPPE_PATH} \
+      --no-procfile \
+      --no-backups \
+      --skip-redis-config-generation \
+      --verbose \
+      frappe-bench && \
+    rm base-apps.json; \
+else \
+    echo "No base apps.json provided, installing frappe only" && \
+    bench init \
+      --frappe-branch=${FRAPPE_BRANCH} \
+      --frappe-path=${FRAPPE_PATH} \
+      --no-procfile \
+      --no-backups \
+      --skip-redis-config-generation \
+      --verbose \
+      frappe-bench; \
+fi
+
+WORKDIR /home/frappe/frappe-bench
+
+RUN echo "{}" > sites/common_site_config.json
+
+# Ensure setuptools (pkg_resources) and other pinned deps before any site install
+RUN ./env/bin/pip install --no-cache-dir -r /tmp/requirements-pinned.txt
+
+# ================================
+# final base image
+# ================================
+
+FROM base
+
+USER frappe
+
+COPY --from=builder --chown=frappe:frappe \
+ /home/frappe/frappe-bench \
+ /home/frappe/frappe-bench
+
+WORKDIR /home/frappe/frappe-bench
+
+# Same VOLUME list as official frappe_docker for compose/pwd compatibility
+VOLUME [ \
+  "/home/frappe/frappe-bench/sites", \
+  "/home/frappe/frappe-bench/sites/assets", \
+  "/home/frappe/frappe-bench/logs" \
+]
+
+# Default CMD: gunicorn (same as official frappe_docker production image).
+# pwd.yml/compose use this for the backend service; other services override with command.
+CMD [ \
+  "/home/frappe/frappe-bench/env/bin/gunicorn", \
+  "--chdir=/home/frappe/frappe-bench/sites", \
+  "--bind=0.0.0.0:8000", \
+  "--threads=4", \
+  "--workers=2", \
+  "--worker-class=gthread", \
+  "--worker-tmp-dir=/dev/shm", \
+  "--timeout=120", \
+  "--preload", \
+  "frappe.app:application" \
+]
